@@ -1,14 +1,14 @@
-name: Create New OpenClaw
+name: Create OpenClaw
 
 on:
   workflow_dispatch:
     inputs:
       username:
-        description: "Username for the OpenClaw instance (lowercase alphanumeric, hyphens allowed)"
+        description: "Username for the OpenClaw instance"
         required: true
         type: string
       model:
-        description: "AI model for Cloudflare AI Gateway (e.g. workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast, openai/gpt-4o, bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0)"
+        description: "AI model for Cloudflare AI Gateway"
         required: true
         type: string
       telegram_bot_token:
