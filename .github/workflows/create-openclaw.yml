@@ -1,0 +1,186 @@
+name: Create OpenClaw
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "Username for the OpenClaw instance"
+        required: true
+        type: string
+      model:
+        description: "AI model for Cloudflare AI Gateway"
+        required: true
+        type: choice
+        default: "openai/gpt-5.2"
+        options:
+          - "openai/gpt-5.2"
+      telegram_bot_token:
+        description: "Telegram Bot Token for this instance (leave empty to skip)"
+        required: false
+        type: string
+      telegram_user_id:
+        description: "Your Telegram user ID for DM allowlist (see README for how to find it)"
+        required: false
+        type: string
+      instance_type:
+        description: "Container instance type"
+        required: true
+        type: choice
+        default: "standard-2"
+        options:
+          - "standard-1"
+          - "standard-2"
+          - "standard-3"
+          - "standard-4"
+      sandbox_sleep_after:
+        description: "Container sleep timeout in minutes, or 'never' (default: 30)"
+        required: false
+        type: string
+        default: "30"
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          USERNAME="${{ inputs.username }}"
+          MODEL="${{ inputs.model }}"
+
+          if ! echo "$USERNAME" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+            echo "::error::Invalid username '${USERNAME}'. Must be lowercase alphanumeric with optional hyphens, cannot start/end with hyphen."
+            exit 1
+          fi
+
+          echo "Model: ${MODEL}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure wrangler for user namespace
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+          R2_BUCKET="openclaw-${{ inputs.username }}-data"
+
+          echo "Worker name: ${WORKER_NAME}"
+          echo "R2 bucket:   ${R2_BUCKET}"
+
+          sed -i "s|\"name\": \"moltbot-sandbox\"|\"name\": \"${WORKER_NAME}\"|" wrangler.jsonc
+          sed -i "s|\"bucket_name\": \"moltbot-data\"|\"bucket_name\": \"${R2_BUCKET}\"|" wrangler.jsonc
+          sed -i "s|\"instance_type\": \"standard-1\"|\"instance_type\": \"${{ inputs.instance_type }}\"|" wrangler.jsonc
+
+      - name: Create R2 bucket
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          npx wrangler r2 bucket create "openclaw-${{ inputs.username }}-data" 2>&1 || echo "::warning::Bucket may already exist, continuing..."
+
+      - name: Generate deterministic tokens
+        id: token
+        env:
+          HMAC_KEY: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # Deterministic: same username always produces the same token
+          GATEWAY_TOKEN=$(printf '%s' "openclaw-gateway-${{ inputs.username }}" | openssl dgst -sha256 -hmac "$HMAC_KEY" | awk '{print $NF}')
+          echo "gateway_token=${GATEWAY_TOKEN}" >> "$GITHUB_OUTPUT"
+
+          CDP_SECRET=$(printf '%s' "openclaw-cdp-${{ inputs.username }}" | openssl dgst -sha256 -hmac "$HMAC_KEY" | awk '{print $NF}')
+          echo "::add-mask::${CDP_SECRET}"
+          echo "cdp_secret=${CDP_SECRET}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy moltworker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      - name: Set worker secrets and redeploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+
+          SLEEP_AFTER="${{ inputs.sandbox_sleep_after }}"
+          if [ "$SLEEP_AFTER" = "never" ]; then
+            SLEEP_VALUE="never"
+          else
+            SLEEP_VALUE="${SLEEP_AFTER}m"
+          fi
+
+          # Bulk-set all secrets in a single API call
+          jq -n \
+            --arg cf_account_id           "${{ secrets.CF_ACCOUNT_ID }}" \
+            --arg ai_gw_api_key           "${{ secrets.CLOUDFLARE_AI_GATEWAY_API_KEY }}" \
+            --arg ai_gw_gateway_id        "${{ secrets.CF_AI_GATEWAY_GATEWAY_ID }}" \
+            --arg ai_gw_model             "${{ inputs.model }}" \
+            --arg telegram_bot_token      "${{ inputs.telegram_bot_token }}" \
+            --arg telegram_user_id        "${{ inputs.telegram_user_id }}" \
+            --arg gateway_token           "${{ steps.token.outputs.gateway_token }}" \
+            --arg r2_access_key_id        "${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --arg r2_secret_access_key    "${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --arg r2_bucket_name          "openclaw-${{ inputs.username }}-data" \
+            --arg cdp_secret              "${{ steps.token.outputs.cdp_secret }}" \
+            --arg worker_url              "https://openclaw-${{ inputs.username }}.notifly.workers.dev" \
+            --arg sandbox_sleep_after     "$SLEEP_VALUE" \
+            --arg cf_access_team_domain   "${{ secrets.CF_ACCESS_TEAM_DOMAIN }}" \
+            --arg cf_access_aud           "${{ secrets.CF_ACCESS_AUD }}" \
+            '{
+              CF_ACCOUNT_ID:                $cf_account_id,
+              CF_AI_GATEWAY_ACCOUNT_ID:     $cf_account_id,
+              CLOUDFLARE_AI_GATEWAY_API_KEY: $ai_gw_api_key,
+              CF_AI_GATEWAY_GATEWAY_ID:     $ai_gw_gateway_id,
+              CF_AI_GATEWAY_MODEL:          $ai_gw_model,
+              MOLTBOT_GATEWAY_TOKEN:        $gateway_token,
+              R2_ACCESS_KEY_ID:             $r2_access_key_id,
+              R2_SECRET_ACCESS_KEY:         $r2_secret_access_key,
+              R2_BUCKET_NAME:               $r2_bucket_name,
+              CDP_SECRET:                   $cdp_secret,
+              WORKER_URL:                   $worker_url,
+              SANDBOX_SLEEP_AFTER:          $sandbox_sleep_after,
+              CF_ACCESS_TEAM_DOMAIN:        $cf_access_team_domain,
+              CF_ACCESS_AUD:                $cf_access_aud
+            }
+            + if $telegram_bot_token != "" then {TELEGRAM_BOT_TOKEN: $telegram_bot_token} else {} end
+            + if $telegram_user_id != "" then {TELEGRAM_DM_ALLOW_FROM: $telegram_user_id} else {} end
+            ' | npx wrangler secret bulk --name "$WORKER_NAME"
+
+          # Re-deploy to ensure the container starts with the correct secrets.
+          # Without this, a container may auto-start between the initial deploy
+          # and secret configuration, caching stale/empty tokens (cf. cloudflare/moltworker#58).
+          npx wrangler deploy
+
+      - name: Deployment summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## OpenClaw Created
+
+          | Item | Value |
+          |------|-------|
+          | **Worker** | \`openclaw-${{ inputs.username }}\` |
+          | **R2 Bucket** | \`openclaw-${{ inputs.username }}-data\` |
+          | **Model** | \`${{ inputs.model }}\` |
+          | **Instance Type** | \`${{ inputs.instance_type }}\` |
+          | **Telegram** | ${{ inputs.telegram_bot_token && 'Configured' || 'Skipped (no token provided)' }} |
+          | **Sleep After** | \`${{ inputs.sandbox_sleep_after }}m\` |
+          | **CDP** | Enabled (secret auto-generated) |
+          | **Gateway Token** | Auto-generated (stored as worker secret) |
+
+          ### Initial Access
+
+          1. Open the **Chat** link below to connect your browser (the \`token\` query parameter auto-authenticates the first visit):
+             - [https://openclaw-${{ inputs.username }}.notifly.workers.dev/?token=${{ steps.token.outputs.gateway_token }}](https://openclaw-${{ inputs.username }}.notifly.workers.dev/?token=${{ steps.token.outputs.gateway_token }})
+          2. Go to **Admin** to pair devices, manage settings, and view connected clients:
+             - [https://openclaw-${{ inputs.username }}.notifly.workers.dev/_admin/](https://openclaw-${{ inputs.username }}.notifly.workers.dev/_admin/)
+          EOF

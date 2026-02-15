@@ -1,0 +1,173 @@
+name: Update OpenClaw
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "Username of the existing OpenClaw instance to update"
+        required: true
+        type: string
+      model:
+        description: "AI model for Cloudflare AI Gateway"
+        required: true
+        type: choice
+        default: "keep-existing"
+        options:
+          - "keep-existing"
+          - "openai/gpt-5.2"
+      telegram_bot_token:
+        description: "Telegram Bot Token (leave empty to keep existing)"
+        required: false
+        type: string
+      telegram_user_id:
+        description: "Your Telegram user ID for DM allowlist (leave empty to keep existing)"
+        required: false
+        type: string
+      instance_type:
+        description: "Container instance type"
+        required: true
+        type: choice
+        default: "standard-2"
+        options:
+          - "standard-1"
+          - "standard-2"
+          - "standard-3"
+          - "standard-4"
+      sandbox_sleep_after:
+        description: "Container sleep timeout in minutes or 'never' (leave empty to keep existing)"
+        required: false
+        type: string
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          USERNAME="${{ inputs.username }}"
+          MODEL="${{ inputs.model }}"
+
+          if ! echo "$USERNAME" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+            echo "::error::Invalid username '${USERNAME}'. Must be lowercase alphanumeric with optional hyphens."
+            exit 1
+          fi
+
+          if [ "$MODEL" != "keep-existing" ]; then
+            echo "Model: ${MODEL}"
+          else
+            echo "Model: unchanged"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure wrangler for user namespace
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+          R2_BUCKET="openclaw-${{ inputs.username }}-data"
+
+          echo "Worker name: ${WORKER_NAME}"
+          echo "R2 bucket:   ${R2_BUCKET}"
+
+          sed -i "s|\"name\": \"moltbot-sandbox\"|\"name\": \"${WORKER_NAME}\"|" wrangler.jsonc
+          sed -i "s|\"bucket_name\": \"moltbot-data\"|\"bucket_name\": \"${R2_BUCKET}\"|" wrangler.jsonc
+
+          sed -i "s|\"instance_type\": \"standard-1\"|\"instance_type\": \"${{ inputs.instance_type }}\"|" wrangler.jsonc
+
+      - name: Update worker secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+
+          SLEEP_AFTER="${{ inputs.sandbox_sleep_after }}"
+          if [ "$SLEEP_AFTER" = "never" ]; then
+            SLEEP_VALUE="never"
+          elif [ -n "$SLEEP_AFTER" ]; then
+            SLEEP_VALUE="${SLEEP_AFTER}m"
+          else
+            SLEEP_VALUE=""
+          fi
+
+          # Bulk-set all secrets in a single API call.
+          # Optional fields (model, telegram, sleep) are included only when provided.
+          jq -n \
+            --arg cf_account_id           "${{ secrets.CF_ACCOUNT_ID }}" \
+            --arg ai_gw_api_key           "${{ secrets.CLOUDFLARE_AI_GATEWAY_API_KEY }}" \
+            --arg ai_gw_gateway_id        "${{ secrets.CF_AI_GATEWAY_GATEWAY_ID }}" \
+            --arg ai_gw_model             "${{ inputs.model }}" \
+            --arg telegram_bot_token      "${{ inputs.telegram_bot_token }}" \
+            --arg telegram_user_id        "${{ inputs.telegram_user_id }}" \
+            --arg r2_access_key_id        "${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --arg r2_secret_access_key    "${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --arg r2_bucket_name          "openclaw-${{ inputs.username }}-data" \
+            --arg worker_url              "https://openclaw-${{ inputs.username }}.notifly.workers.dev" \
+            --arg sandbox_sleep_after     "$SLEEP_VALUE" \
+            --arg cf_access_team_domain   "${{ secrets.CF_ACCESS_TEAM_DOMAIN }}" \
+            --arg cf_access_aud           "${{ secrets.CF_ACCESS_AUD }}" \
+            '{
+              CF_ACCOUNT_ID:                $cf_account_id,
+              CF_AI_GATEWAY_ACCOUNT_ID:     $cf_account_id,
+              CLOUDFLARE_AI_GATEWAY_API_KEY: $ai_gw_api_key,
+              CF_AI_GATEWAY_GATEWAY_ID:     $ai_gw_gateway_id,
+              R2_ACCESS_KEY_ID:             $r2_access_key_id,
+              R2_SECRET_ACCESS_KEY:         $r2_secret_access_key,
+              R2_BUCKET_NAME:               $r2_bucket_name,
+              WORKER_URL:                   $worker_url,
+              CF_ACCESS_TEAM_DOMAIN:        $cf_access_team_domain,
+              CF_ACCESS_AUD:                $cf_access_aud
+            }
+            + if $ai_gw_model != "keep-existing" then {CF_AI_GATEWAY_MODEL: $ai_gw_model} else {} end
+            + if $telegram_bot_token != "" then {TELEGRAM_BOT_TOKEN: $telegram_bot_token} else {} end
+            + if $telegram_user_id != "" then {TELEGRAM_DM_ALLOW_FROM: $telegram_user_id} else {} end
+            + if $sandbox_sleep_after != "" then {SANDBOX_SLEEP_AFTER: $sandbox_sleep_after} else {} end
+            ' | npx wrangler secret bulk --name "$WORKER_NAME"
+
+      - name: Delete running container
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+          echo "Looking for containers associated with worker: ${WORKER_NAME}"
+
+          CONTAINER_ID=$(npx wrangler containers list 2>/dev/null | jq -r '.[] | select(.name | test("'"$WORKER_NAME"'")) | .id' 2>/dev/null)
+
+          if [ -n "$CONTAINER_ID" ]; then
+            echo "Deleting container: ${CONTAINER_ID}"
+            npx wrangler containers delete "$CONTAINER_ID" 2>&1 || echo "::warning::Failed to delete container ${CONTAINER_ID}"
+          else
+            echo "::warning::No container found for worker ${WORKER_NAME}, skipping"
+          fi
+
+      - name: Deploy with updated secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      - name: Deployment summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## OpenClaw Updated
+
+          | Item | Value |
+          |------|-------|
+          | **Worker** | \`openclaw-${{ inputs.username }}\` |
+          | **Model** | ${{ inputs.model != 'keep-existing' && format('`{0}`', inputs.model) || 'Unchanged' }} |
+          | **Instance Type** | \`${{ inputs.instance_type }}\` |
+          | **Telegram** | ${{ inputs.telegram_bot_token && 'Updated' || 'Unchanged (no token provided)' }} |
+          | **Sleep After** | ${{ inputs.sandbox_sleep_after && format('{0}m', inputs.sandbox_sleep_after) || 'Unchanged' }} |
+          | **Gateway Token** | Unchanged |
+          EOF

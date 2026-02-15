@@ -1,0 +1,90 @@
+name: Delete OpenClaw
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "Username of the OpenClaw instance to delete"
+        required: true
+        type: string
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          USERNAME="${{ inputs.username }}"
+          if ! echo "$USERNAME" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+            echo "::error::Invalid username '${USERNAME}'. Must be lowercase alphanumeric with optional hyphens."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Delete container
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+          echo "Looking for containers associated with worker: ${WORKER_NAME}"
+
+          # Parse JSON output to extract container ID by name
+          CONTAINER_ID=$(npx wrangler containers list 2>/dev/null | jq -r '.[] | select(.name | test("'"$WORKER_NAME"'")) | .id' 2>/dev/null)
+
+          if [ -n "$CONTAINER_ID" ]; then
+            echo "Deleting container: ${CONTAINER_ID}"
+            npx wrangler containers delete "$CONTAINER_ID" 2>&1 || echo "::warning::Failed to delete container ${CONTAINER_ID}"
+          else
+            echo "::warning::No container found for worker ${WORKER_NAME}, skipping"
+          fi
+
+      - name: Delete openclaw worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          WORKER_NAME="openclaw-${{ inputs.username }}"
+          echo "Deleting worker: ${WORKER_NAME}"
+          npx wrangler delete --name "$WORKER_NAME" --force
+
+      - name: Empty and delete R2 bucket
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          R2_BUCKET="openclaw-${{ inputs.username }}-data"
+          R2_ENDPOINT="https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+
+          echo "Emptying R2 bucket: ${R2_BUCKET}"
+          aws s3 rm "s3://${R2_BUCKET}" --recursive --endpoint-url "$R2_ENDPOINT" 2>&1 || echo "::warning::Failed to empty bucket"
+
+          echo "Deleting R2 bucket: ${R2_BUCKET}"
+          npx wrangler r2 bucket delete "$R2_BUCKET" 2>&1 || echo "::warning::Could not delete bucket"
+
+      - name: Deletion summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## OpenClaw Deleted
+
+          | Item | Status |
+          |------|--------|
+          | **Container** | Deleted |
+          | **Worker** \`openclaw-${{ inputs.username }}\` | Deleted |
+          | **R2 Bucket** \`openclaw-${{ inputs.username }}-data\` | Deleted |
+          EOF

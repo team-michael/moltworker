@@ -16,8 +16,8 @@ fi
 
 CONFIG_DIR="/root/.openclaw"
 CONFIG_FILE="$CONFIG_DIR/openclaw.json"
-WORKSPACE_DIR="/root/clawd"
-SKILLS_DIR="/root/clawd/skills"
+WORKSPACE_DIR="/root/.openclaw/workspace"
+SKILLS_DIR="/root/.openclaw/workspace/skills"
 RCLONE_CONF="/root/.config/rclone/rclone.conf"
 LAST_SYNC_FILE="/tmp/.last-sync"
 
@@ -223,7 +223,7 @@ if (process.env.CF_AI_GATEWAY_MODEL) {
 // Overwrite entire channel object to drop stale keys from old R2 backups
 // that would fail OpenClaw's strict config validation (see #47)
 if (process.env.TELEGRAM_BOT_TOKEN) {
-    const dmPolicy = process.env.TELEGRAM_DM_POLICY || 'pairing';
+    const dmPolicy = process.env.TELEGRAM_DM_POLICY || 'allowlist';
     config.channels.telegram = {
         botToken: process.env.TELEGRAM_BOT_TOKEN,
         enabled: true,
@@ -260,9 +260,79 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
     };
 }
 
+// Browser profile for cloudflare-browser custom skill (do NOT set browser.enabled
+// to avoid built-in browser tool reachability check that fails on container loopback)
+if (process.env.CDP_SECRET && process.env.WORKER_URL) {
+    const workerUrl = process.env.WORKER_URL.replace(/\/+$/, '');
+    const cdpUrl = workerUrl + '/cdp?secret=' + encodeURIComponent(process.env.CDP_SECRET);
+    config.browser = config.browser || {};
+    config.browser.enabled = false;
+    config.browser.profiles = config.browser.profiles || {};
+    config.browser.profiles.cloudflare = { cdpUrl: cdpUrl, color: '#F6821F' };
+    console.log('Browser profile configured for cloudflare-browser skill: ' + workerUrl + '/cdp');
+}
+
+// Tool policy: deny built-in browser (use cloudflare-browser skill instead)
+// and disable web_search (no Brave/Perplexity API key available)
+config.tools = config.tools || {};
+config.tools.deny = config.tools.deny || [];
+if (!config.tools.deny.includes('browser')) {
+    config.tools.deny.push('browser');
+}
+config.tools.web = config.tools.web || {};
+config.tools.web.search = config.tools.web.search || {};
+config.tools.web.search.enabled = false;
+
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration patched successfully');
 EOFPATCH
+
+# ============================================================
+# PATCH TOOLS.MD (browser & web search guidance for agent)
+# ============================================================
+TOOLS_FILE="$WORKSPACE_DIR/TOOLS.md"
+TOOLS_MARKER="## Browser (cloudflare-browser)"
+
+if [ -f "$TOOLS_FILE" ] && grep -qF "$TOOLS_MARKER" "$TOOLS_FILE"; then
+    echo "TOOLS.md already has browser guidance, skipping"
+else
+    echo "Appending browser tool guidance to TOOLS.md..."
+    cat >> "$TOOLS_FILE" << 'EOFTOOLS'
+
+## Browser (cloudflare-browser)
+
+The built-in browser tool is **denied by policy** (`tools.deny`). Do NOT attempt to call it — it will be rejected. When you need to browse web pages, take screenshots, scrape content, or perform any browser automation, use the `cloudflare-browser` skill instead.
+
+### Quick Reference
+
+```bash
+# Screenshot
+node ~/skills/cloudflare-browser/scripts/screenshot.js <url> [output.png]
+
+# Get page text content
+node -e "
+const { createClient } = require('$HOME/.openclaw/workspace/skills/cloudflare-browser/scripts/cdp-client');
+(async () => {
+  const client = await createClient();
+  await client.navigate('URL_HERE', 5000);
+  const text = await client.getText();
+  console.log(text);
+  client.close();
+})();
+"
+
+# Multi-page video
+node ~/skills/cloudflare-browser/scripts/video.js "url1,url2" [output.mp4]
+```
+
+Environment variables `CDP_SECRET` and `WORKER_URL` are pre-configured.
+
+## Web Search
+
+Web search is **disabled** (no search API key available). Use the `cloudflare-browser` skill to navigate directly to URLs when you need web content.
+EOFTOOLS
+    echo "TOOLS.md patched"
+fi
 
 # ============================================================
 # BACKGROUND SYNC LOOP
