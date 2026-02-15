@@ -98,6 +98,14 @@ else
     echo "R2 not configured, starting fresh"
 fi
 
+# Install skill dependencies (node_modules are not synced to R2)
+for pkg in "$SKILLS_DIR"/*/package.json; do
+    [ -f "$pkg" ] || continue
+    skill_dir=$(dirname "$pkg")
+    echo "Installing dependencies for skill: $(basename "$skill_dir")"
+    (cd "$skill_dir" && npm install --production 2>&1) || echo "WARNING: npm install failed in $skill_dir"
+done
+
 # ============================================================
 # ONBOARD (only if no config exists yet)
 # ============================================================
@@ -368,7 +376,7 @@ if r2_configured; then
                 fi
                 if [ -d "$SKILLS_DIR" ]; then
                     rclone sync "$SKILLS_DIR/" "r2:${R2_BUCKET}/skills/" \
-                        $RCLONE_FLAGS 2>> "$LOGFILE"
+                        $RCLONE_FLAGS --exclude='node_modules/**' 2>> "$LOGFILE"
                 fi
                 date -Iseconds > "$LAST_SYNC_FILE"
                 touch "$MARKER"

@@ -36,8 +36,9 @@ RUN mkdir -p /root/.openclaw \
 COPY start-openclaw.sh /usr/local/bin/start-openclaw.sh
 RUN chmod +x /usr/local/bin/start-openclaw.sh
 
-# Copy custom skills
+# Copy custom skills and install their dependencies
 COPY skills/ /root/.openclaw/workspace/skills/
+RUN cd /root/.openclaw/workspace/skills/cloudflare-browser && npm install --production
 
 # Set working directory
 WORKDIR /root/clawd
