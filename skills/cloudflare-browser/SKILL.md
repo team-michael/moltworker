@@ -7,6 +7,16 @@ description: Control headless Chrome via Cloudflare Browser Rendering CDP WebSoc
 
 Control headless browsers via Cloudflare's Browser Rendering service using CDP (Chrome DevTools Protocol) over WebSocket.
 
+## When to Use First
+
+Use this skill first when the user asks to:
+- Open or navigate to a URL (for example, `open https://...`)
+- Take screenshots or record browser output
+- Scrape or inspect rendered page content
+- Perform browser automation in a Cloudflare Workers environment
+
+If browser execution fails (CDP auth/connectivity/runtime), fall back to non-browser web fetch only as a backup path.
+
 ## Prerequisites
 
 - `CDP_SECRET` environment variable set
@@ -25,13 +35,15 @@ Control headless browsers via Cloudflare's Browser Rendering service using CDP (
 
 ### Screenshot
 ```bash
-node /path/to/skills/cloudflare-browser/scripts/screenshot.js https://example.com output.png
+node /root/.openclaw/workspace/skills/cloudflare-browser/scripts/screenshot.js https://example.com output.png
 ```
 
 ### Multi-page Video
 ```bash
-node /path/to/skills/cloudflare-browser/scripts/video.js "https://site1.com,https://site2.com" output.mp4
+node /root/.openclaw/workspace/skills/cloudflare-browser/scripts/video.js "https://site1.com,https://site2.com" output.mp4
 ```
+
+Compatibility symlinks are also available: `/root/clawd/skills` and `~/skills`.
 
 ## CDP Connection Pattern
 

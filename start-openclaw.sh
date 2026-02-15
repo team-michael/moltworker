@@ -24,6 +24,14 @@ LAST_SYNC_FILE="/tmp/.last-sync"
 echo "Config directory: $CONFIG_DIR"
 
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$WORKSPACE_DIR"
+mkdir -p "$SKILLS_DIR"
+mkdir -p /root/clawd
+
+# Ensure legacy skill paths continue to work.
+ln -sfn "$SKILLS_DIR" /root/clawd/skills
+ln -sfn "$SKILLS_DIR" /root/skills
+echo "Skill path compatibility links configured: /root/clawd/skills, /root/skills -> $SKILLS_DIR"
 
 # ============================================================
 # RCLONE SETUP
@@ -296,30 +304,56 @@ console.log('Configuration patched successfully');
 EOFPATCH
 
 # ============================================================
-# PATCH TOOLS.MD (browser & web search guidance for agent)
+# PATCH TOOLS.MD (browser guidance for agent; managed block, always refreshed)
 # ============================================================
 TOOLS_FILE="$WORKSPACE_DIR/TOOLS.md"
-TOOLS_MARKER="## Browser (cloudflare-browser)"
+TOOLS_BEGIN="<!-- BEGIN: CLOUDFLARE_BROWSER_GUIDE -->"
+TOOLS_END="<!-- END: CLOUDFLARE_BROWSER_GUIDE -->"
 
-if [ -f "$TOOLS_FILE" ] && grep -qF "$TOOLS_MARKER" "$TOOLS_FILE"; then
-    echo "TOOLS.md already has browser guidance, skipping"
-else
-    echo "Appending browser tool guidance to TOOLS.md..."
-    cat >> "$TOOLS_FILE" << 'EOFTOOLS'
+mkdir -p "$WORKSPACE_DIR"
+touch "$TOOLS_FILE"
 
-## Browser (cloudflare-browser)
+echo "Refreshing managed browser guidance in TOOLS.md..."
 
-The built-in browser tool is **denied by policy** (`tools.deny`). Do NOT attempt to call it — it will be rejected. When you need to browse web pages, take screenshots, scrape content, or perform any browser automation, use the `cloudflare-browser` skill instead.
+# Remove previously managed block (if present).
+tmp_tools="$(mktemp)"
+awk -v begin="$TOOLS_BEGIN" -v end="$TOOLS_END" '
+  $0 == begin { in_block = 1; next }
+  $0 == end { in_block = 0; next }
+  !in_block { print }
+' "$TOOLS_FILE" > "$tmp_tools"
+mv "$tmp_tools" "$TOOLS_FILE"
+
+# Remove legacy unmanaged block from older startup script versions.
+tmp_tools="$(mktemp)"
+awk '
+  BEGIN { skip = 0 }
+  $0 == "## Browser (cloudflare-browser)" { skip = 1; next }
+  skip && /^## / && $0 != "## Web Search" { skip = 0 }
+  !skip { print }
+' "$TOOLS_FILE" > "$tmp_tools"
+mv "$tmp_tools" "$TOOLS_FILE"
+
+tmp_tools="$(mktemp)"
+cat > "$tmp_tools" << 'EOFTOOLS'
+<!-- BEGIN: CLOUDFLARE_BROWSER_GUIDE -->
+## Browser Access Priority (cloudflare-browser)
+
+The built-in browser tool is **denied by policy** (`tools.deny`). Do NOT attempt to call it.
+
+When a request includes URL navigation or browser tasks (`open https://...`, browse, screenshot, scrape, automation), use the `cloudflare-browser` skill **first**.
+
+Only if CDP/browser-skill execution fails (connectivity, auth, or runtime failure), fall back to non-browser web fetch approaches.
 
 ### Quick Reference
 
 ```bash
 # Screenshot
-node ~/skills/cloudflare-browser/scripts/screenshot.js <url> [output.png]
+node /root/.openclaw/workspace/skills/cloudflare-browser/scripts/screenshot.js <url> [output.png]
 
 # Get page text content
 node -e "
-const { createClient } = require('$HOME/.openclaw/workspace/skills/cloudflare-browser/scripts/cdp-client');
+const { createClient } = require('/root/.openclaw/workspace/skills/cloudflare-browser/scripts/cdp-client');
 (async () => {
   const client = await createClient();
   await client.navigate('URL_HERE', 5000);
@@ -330,17 +364,25 @@ const { createClient } = require('$HOME/.openclaw/workspace/skills/cloudflare-br
 "
 
 # Multi-page video
-node ~/skills/cloudflare-browser/scripts/video.js "url1,url2" [output.mp4]
+node /root/.openclaw/workspace/skills/cloudflare-browser/scripts/video.js "url1,url2" [output.mp4]
 ```
 
+Canonical skills path: `/root/.openclaw/workspace/skills`.
+Compatibility symlinks are also available: `/root/clawd/skills`, `~/skills`.
 Environment variables `CDP_SECRET` and `WORKER_URL` are pre-configured.
 
 ## Web Search
 
-Web search is **disabled** (no search API key available). Use the `cloudflare-browser` skill to navigate directly to URLs when you need web content.
+Web search is **disabled** (no search API key available). For direct URL access, use the `cloudflare-browser` skill first.
+<!-- END: CLOUDFLARE_BROWSER_GUIDE -->
 EOFTOOLS
-    echo "TOOLS.md patched"
+
+if [ -s "$TOOLS_FILE" ]; then
+    printf "\n" >> "$tmp_tools"
+    cat "$TOOLS_FILE" >> "$tmp_tools"
 fi
+mv "$tmp_tools" "$TOOLS_FILE"
+echo "TOOLS.md browser guidance refreshed"
 
 # ============================================================
 # BACKGROUND SYNC LOOP
